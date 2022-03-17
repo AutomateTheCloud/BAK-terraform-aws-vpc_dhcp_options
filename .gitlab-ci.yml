@@ -1,0 +1,80 @@
+variables:
+  AWS_ROLE_CICD: "arn:aws:iam::590383328852:role/cloud_enablement"
+  S3_BUCKET: "nss-terraform-registry"
+
+stages:
+  - build
+  - release:dev
+  - approve:stable
+  - release:stable
+
+before_script:
+  - source aws-assume-role -r ${AWS_ROLE_CICD}
+
+build:
+  stage: build
+  except:
+    - tags
+  script:
+    - touch job.vars; > job.vars
+    - export TMP_NAME="$(cat main.tf 2>/dev/null | grep "^# name:" | awk -F":" '{print $2}' | sed -e 's/^ *//g' -e 's/ *$//g' | tr "[:upper:]" "[:lower:]")"
+    - export TMP_VERSION="$(cat main.tf 2>/dev/null | grep "^# version:" | awk -F":" '{print $2}' | sed -e 's/^ *//g' -e 's/ *$//g' | tr "[:upper:]" "[:lower:]")"
+    - export TMP_PROVIDER="$(cat main.tf 2>/dev/null | grep "^# provider:" | awk -F":" '{print $2}' | sed -e 's/^ *//g' -e 's/ *$//g' | tr "[:upper:]" "[:lower:]")"
+    - if [[ "${CI_COMMIT_REF_NAME^^}" == "MASTER" ]]; then export TMP_WORKING_VERSION="${TMP_VERSION}-$(date '+%Y%m%d%H%M')-rc"; else export TMP_WORKING_VERSION="${TMP_VERSION}-$(date '+%Y%m%d%H%M')-dev"; fi
+    - echo "NAME=\"${TMP_NAME}\"" >> job.vars
+    - echo "VERSION=\"${TMP_VERSION}\"" >> job.vars
+    - echo "PROVIDER=\"${TMP_PROVIDER}\"" >> job.vars
+    - echo "WORKING_VERSION=\"${TMP_WORKING_VERSION}\"" >> job.vars
+    - source job.vars
+    - if test -z "${NAME}"; then echo "ERROR - Module Name could not be detected"; exit 1; fi
+    - if test -z "${VERSION}"; then echo "ERROR - Module Version could not be detected"; exit 1; fi
+    - if test -z "${PROVIDER}"; then echo "ERROR - Module Provider could not be detected"; exit 1; fi
+    - if test -z "${WORKING_VERSION}"; then echo "ERROR - Working Version could not be determined"; exit 1; fi
+    - if aws s3 ls s3://${S3_BUCKET}/${PROVIDER}/${NAME}/${VERSION}.tgz >/dev/null 2>&1; then echo "Stable Version [${VERSION}] already exists and will not be overwritten"; exit 1; fi
+    - cd ${CI_PROJECT_DIR}
+    - command -v tfswitch --version >/dev/null 2>&1 && { tfswitch; }
+    - cd ${CI_PROJECT_DIR}/example
+    - terraform init -backend=false
+    - terraform validate
+    - cd ${CI_PROJECT_DIR}/
+    - tar zcvf module.tgz -C ${CI_PROJECT_DIR}/ --exclude='.[^/]*' --exclude='module.tgz' *
+  artifacts:
+    paths:
+      - job.vars
+      - module.tgz
+
+release:dev:
+  stage: release:dev
+  except:
+    - tags
+    - master
+  script:
+    - source job.vars
+    - aws s3 cp module.tgz s3://${S3_BUCKET}/${PROVIDER}/${NAME}/${WORKING_VERSION}.tgz --sse
+    - echo "[s3://${S3_BUCKET}/${PROVIDER}/${NAME}/${WORKING_VERSION}.tgz]"
+  dependencies:
+    - build
+
+release:stable:
+  stage: release:stable
+  only:
+    - master
+  script:
+    - source job.vars
+    - aws s3 cp module.tgz s3://${S3_BUCKET}/${PROVIDER}/${NAME}/${VERSION}.tgz --sse
+    - echo "[s3://${S3_BUCKET}/${NAME}/${VERSION}.tgz]"
+    - git config user.email "${GITLAB_USER_EMAIL}"
+    - git config user.name "${GITLAB_USER_NAME}"
+    - git remote add api-origin https://oauth2:${GITLAB_ACCESS_TOKEN}@${CI_SERVER_HOST}/${CI_PROJECT_PATH} || true
+    - git tag -l | xargs git tag -d
+    - git fetch --tags -f
+    - >
+      if [ $(git tag -l "${VERSION}") ]; then
+        echo "ERROR - Stable Version [${VERSION}] already exists"
+        exit 1
+      else
+        git tag -a ${VERSION} -m "CI Release - ${VERSION}"
+        git push api-origin ${VERSION}
+      fi
+  dependencies:
+    - build
